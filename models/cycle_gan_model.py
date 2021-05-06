@@ -43,6 +43,7 @@ class CycleGANModel(BaseModel):
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
             parser.add_argument('--use_label_B', action='store_true', help='if true domain B has labels too')
+            parser.add_argument('--use_contrastive_loss_D', action='store_true')
         return parser
 
     def __init__(self, opt):
@@ -101,6 +102,7 @@ class CycleGANModel(BaseModel):
                                             opt.n_layers_D, opt.norm, opt.D_dropout, opt.D_spectral, opt.init_type, opt.init_gain, self.gpu_ids)
             self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
                                             opt.n_layers_D, opt.norm, opt.D_dropout, opt.D_spectral, opt.init_type, opt.init_gain, self.gpu_ids)
+            
 
         if self.isTrain:
             if opt.lambda_identity > 0.0:  # only works when input and output images have the same number of channels
@@ -123,6 +125,8 @@ class CycleGANModel(BaseModel):
                     setattr(self, "loss_" + loss_name, 0)
 
             self.niter=0
+
+            self.cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
 
 
     def set_input(self, input):
@@ -200,9 +204,20 @@ class CycleGANModel(BaseModel):
             self.loss_idt_B = 0
 
         # GAN loss D_A(G_A(A))
-        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
+        nb_preds=int(torch.prod(torch.tensor(self.netD_A(self.real_B).shape)))
+        
+        if self.opt.use_contrastive_loss_D:
+            temp=torch.cat((self.netD_A(self.real_B).flatten().unsqueeze(1),self.netD_A(self.fake_B).flatten().unsqueeze(0).repeat(nb_preds,1)),dim=1)
+            self.loss_G_A = self.cross_entropy_loss(-temp,torch.zeros(temp.shape[0], dtype=torch.long,device=temp.device)).mean()
+        else:
+            self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
         # GAN loss D_B(G_B(B))
-        self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
+        
+        if self.opt.use_contrastive_loss_D:
+            temp=torch.cat((self.netD_B(self.real_A).flatten().unsqueeze(1),self.netD_B(self.fake_A).flatten().unsqueeze(0).repeat(nb_preds,1)),dim=1)
+            self.loss_G_B = self.cross_entropy_loss(-temp,torch.zeros(temp.shape[0], dtype=torch.long,device=temp.device)).mean()
+        else:
+            self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
         # Forward cycle loss || G_B(G_A(A)) - A||
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
@@ -225,10 +240,46 @@ class CycleGANModel(BaseModel):
         # D_A and D_B
         self.set_requires_grad([self.netD_A, self.netD_B], True)
         self.set_requires_grad([self.netG_A, self.netG_B], False)
-        
-        self.compute_D_loss()      # calculate gradients for D_A and D_B
+
+        if self.opt.use_contrastive_loss_D:
+            self.compute_D_contrastive_loss()      # calculate gradients for D_A and D_B
+        else:
+            self.compute_D_loss()
         (self.loss_D/self.opt.iter_size).backward()
         
         self.compute_step(self.optimizer_D,self.loss_names_D)
                         
         self.niter = self.niter +1
+
+
+    def compute_D_contrastive_loss(self):
+        """Calculate contrastive GAN loss for the discriminator"""
+        fake_B = self.fake_B.detach()
+        fake_A = self.fake_A.detach()
+        
+        # Fake; stop backprop to the generator by detaching fake_B
+        pred_fake_A = self.netD_B(fake_A)
+        pred_fake_B = self.netD_A(fake_B)
+        # Real
+        pred_real_A = self.netD_B(self.real_A)
+        pred_real_B = self.netD_A(self.real_B)
+
+        nb_preds=int(torch.prod(torch.tensor(self.netD_A(self.real_B).shape)))
+        
+        temp=torch.cat((pred_real_A.flatten().unsqueeze(1),pred_fake_A.flatten().unsqueeze(0).repeat(nb_preds,1)),dim=1)
+        loss_D_real_A = self.cross_entropy_loss(temp,torch.zeros(temp.shape[0], dtype=torch.long,device=temp.device)).mean()
+
+        temp=torch.cat((-pred_fake_A.flatten().unsqueeze(1),-pred_real_A.flatten().unsqueeze(0).repeat(nb_preds,1)),dim=1)
+        loss_D_fake_B = self.cross_entropy_loss(temp,torch.zeros(temp.shape[0], dtype=torch.long,device=temp.device)).mean()
+        
+        temp=torch.cat((pred_real_B.flatten().unsqueeze(1),pred_fake_B.flatten().unsqueeze(0).repeat(nb_preds,1)),dim=1)
+        loss_D_real_B = self.cross_entropy_loss(temp,torch.zeros(temp.shape[0], dtype=torch.long,device=temp.device)).mean()
+        
+        temp=torch.cat((-pred_fake_B.flatten().unsqueeze(1),-pred_real_B.flatten().unsqueeze(0).repeat(nb_preds,1)),dim=1)
+        loss_D_fake_A = self.cross_entropy_loss(temp,torch.zeros(temp.shape[0], dtype=torch.long,device=temp.device)).mean()
+        
+        # combine loss and calculate gradients
+        self.loss_D_A = (loss_D_fake_A + loss_D_real_A) * 0.5
+        self.loss_D_B = (loss_D_fake_B + loss_D_real_B) * 0.5
+
+        self.loss_D = self.loss_D_A + self.loss_D_B
